@@ -1,0 +1,28 @@
+# --- Databases (personal financial data) ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Excel exports (personal financial data) ---
+*.xlsx
+*.xls
+
+# --- User data ---
+users/
+
+# --- PyInstaller build artifacts ---
+build/
+dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
