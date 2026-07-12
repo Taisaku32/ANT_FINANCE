@@ -26,9 +26,18 @@ import threading
 import webbrowser
 import time
 
+try:
+    from tkcalendar import DateEntry
+    _HAS_DATE_PICKER = True
+except ImportError:
+    _HAS_DATE_PICKER = False
+
 # --- Fijar directorio de trabajo al lado del .exe cuando está compilado ---
 if getattr(_sys, "frozen", False):
-    os.chdir(os.path.dirname(_sys.executable))
+    _APP_DIR = os.path.dirname(_sys.executable)
+    os.chdir(_APP_DIR)
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- Pedir nombre de usuario ---
 root = tk.Tk()
@@ -40,7 +49,7 @@ if not usuario:
 root.destroy()
 
 # --- Crear carpeta por usuario ---
-BASE_DIR = os.path.join(os.getcwd(), "users", usuario)
+BASE_DIR = os.path.join(_APP_DIR, "users", usuario)
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # 📁 Archivos por usuario
@@ -108,6 +117,14 @@ def crear_base_datos():
             category_id INTEGER NOT NULL REFERENCES categories(id),
             name TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS budgets (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            categoria TEXT    NOT NULL UNIQUE,
+            monto     REAL    NOT NULL CHECK(monto > 0)
         )"""
     )
 
@@ -320,9 +337,14 @@ def abrir_ventana(tipo, table, excel_file, preset_cat=None):
     entry_actividad.pack()
 
     # Fecha
-    tk.Label(win, text="Fecha (YYYY-MM-DD):").pack(pady=(10, 2))
-    entry_fecha = tk.Entry(win, width=28)
-    entry_fecha.insert(0, str(date.today()))
+    tk.Label(win, text="Fecha:").pack(pady=(10, 2))
+    if _HAS_DATE_PICKER:
+        entry_fecha = DateEntry(win, width=26, date_pattern='yyyy-mm-dd',
+                                year=date.today().year, month=date.today().month,
+                                day=date.today().day)
+    else:
+        entry_fecha = tk.Entry(win, width=28)
+        entry_fecha.insert(0, str(date.today()))
     entry_fecha.pack()
 
     def guardar():
@@ -432,9 +454,14 @@ def abrir_ventana_ahorro(tipo_ahorro):
     entry_actividad.pack()
 
     # Fecha
-    tk.Label(win, text="Fecha (YYYY-MM-DD):").pack(pady=(10, 2))
-    entry_fecha = tk.Entry(win, width=28)
-    entry_fecha.insert(0, str(date.today()))
+    tk.Label(win, text="Fecha:").pack(pady=(10, 2))
+    if _HAS_DATE_PICKER:
+        entry_fecha = DateEntry(win, width=26, date_pattern='yyyy-mm-dd',
+                                year=date.today().year, month=date.today().month,
+                                day=date.today().day)
+    else:
+        entry_fecha = tk.Entry(win, width=28)
+        entry_fecha.insert(0, str(date.today()))
     entry_fecha.pack()
 
     def guardar():
@@ -502,16 +529,41 @@ def abrir_ventana_ahorro_retiro():
 # --- Abrir Dashboard ---
 _dashboard_proc = None
 
+def _free_port_8501():
+    """Mata cualquier proceso que esté escuchando en el puerto 8501."""
+    try:
+        result = subprocess.run(
+            ['netstat', '-aon'], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if ':8501 ' in line and 'LISTENING' in line:
+                pid = int(line.split()[-1])
+                if pid > 0:
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                                   capture_output=True)
+                break
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+
 def abrir_dashboard():
     global _dashboard_proc
-    # Si ya hay un servidor corriendo, solo abrir el navegador
-    if _dashboard_proc is not None and _dashboard_proc.poll() is None:
-        webbrowser.open("http://localhost:8501")
-        return
+
+    # Terminar proceso previo si existe
+    if _dashboard_proc is not None:
+        try:
+            _dashboard_proc.terminate()
+            _dashboard_proc.wait(timeout=3)
+        except Exception:
+            pass
+        _dashboard_proc = None
+
+    # Liberar el puerto para que arranque con el código actualizado
+    _free_port_8501()
 
     if getattr(_sys, "frozen", False):
-        # Modo compilado: re-spawnear el mismo .exe en modo servidor
-        # En PyInstaller 6.x los datos van a _internal/ (sys._MEIPASS)
+        # Modo compilado
         script_path = os.path.join(_sys._MEIPASS, "dashboard.py")
         _dashboard_proc = subprocess.Popen(
             [_sys.executable, "--run-dashboard", script_path],
@@ -522,11 +574,12 @@ def abrir_dashboard():
         _dashboard_proc = subprocess.Popen(
             [_sys.executable, "-m", "streamlit", "run", "dashboard.py",
              "--server.headless=true", "--server.port=8501"],
+            cwd=_APP_DIR,
             creationflags=subprocess.CREATE_NO_WINDOW if _sys.platform == "win32" else 0,
         )
 
     def _open_browser():
-        time.sleep(4)
+        time.sleep(5)
         webbrowser.open("http://localhost:8501")
 
     threading.Thread(target=_open_browser, daemon=True).start()

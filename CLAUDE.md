@@ -5,7 +5,13 @@ Personal finance app to register and visualize incomes/expenses (fixed + one-tim
 
 ## Repo layout
 - `main.py`: data-entry UI (register transactions)
-- `dashboard.py`: Streamlit dashboard (tables + charts)
+- `dashboard.py`: Streamlit dashboard (tables + charts + data entry). Dual mode:
+  local (SQLite in `users/`) or cloud (Turso via `[usuarios]` secrets + login)
+- `turso_db.py`: minimal Turso/libSQL HTTP client (Hrana v2 pipeline, sqlite3-like API)
+- `migrar_a_turso.py`: one-time migration of a local user DB to Turso (local DB opened read-only)
+- `DESPLIEGUE.md`: deploy guide (GitHub + Streamlit Community Cloud + Turso)
+- `secrets.ejemplo.toml`: secrets template (real secrets go in Streamlit Cloud settings
+  or `.streamlit/secrets.toml`, both never committed)
 - `finanzas.db`: SQLite DB (root)
 
 Per-user data (do not modify structure lightly):
