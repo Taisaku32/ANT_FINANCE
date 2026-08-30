@@ -216,7 +216,12 @@ def cargar_datos():
 
 
 def cargar_ahorros():
-    df_a = leer_df("SELECT * FROM ahorros", parse_dates=["fecha"])
+    df_a = leer_df("""
+        SELECT a.id, a.monto, a.tipo, a.categoria, a.category_id, a.subcategory_id,
+               a.activity_name, a.fecha, s.name AS subcategoria_nombre
+        FROM ahorros a
+        LEFT JOIN subcategories s ON s.id = a.subcategory_id
+    """, parse_dates=["fecha"])
     if not df_a.empty:
         df_a["monto"] = pd.to_numeric(df_a["monto"], errors="coerce")
     return df_a
@@ -231,11 +236,28 @@ def cargar_metas_ahorro():
         ORDER BY m.created_at DESC
     """)
 
+def _norm_id(valor):
+    """Normaliza un id que puede venir como None, NaN, texto o float."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _neto_ahorros(df: pd.DataFrame) -> float:
+    """Neto (depositos - retiros) de un subconjunto de movimientos de ahorro."""
+    if df.empty:
+        return 0.0
+    signo = df['tipo'].map({'deposito': 1.0, 'retiro': -1.0}).fillna(0.0)
+    montos = pd.to_numeric(df['monto'], errors='coerce').fillna(0.0)
+    return float((montos * signo).sum())
+
+
 def calcular_ahorrado_meta(category_id: int, subcategory_id) -> float:
     """Saldo neto ahorrado para la meta: depositos - retiros de esa categoria/subcategoria."""
-    sub_id = None if (subcategory_id is None or
-                      (isinstance(subcategory_id, float) and pd.isna(subcategory_id))) \
-             else int(subcategory_id)
+    sub_id = _norm_id(subcategory_id)
     saldo_neto = ("COALESCE(SUM(CASE WHEN tipo='deposito' THEN monto ELSE 0 END), 0.0) - "
                   "COALESCE(SUM(CASE WHEN tipo='retiro'   THEN monto ELSE 0 END), 0.0)")
     conn = get_conn()
@@ -788,10 +810,12 @@ st.header('💰 Historial de Ahorros')
 if df_ahorros.empty:
     st.info('No hay movimientos de ahorros registrados.')
 else:
-    cols_show = [c for c in ('id', 'monto', 'tipo', 'categoria', 'activity_name', 'fecha') if c in df_ahorros.columns]
+    cols_show = [c for c in ('id', 'monto', 'tipo', 'categoria', 'subcategoria_nombre',
+                             'activity_name', 'fecha') if c in df_ahorros.columns]
     df_ahorros_display = df_ahorros[cols_show].sort_values('fecha', ascending=False).rename(columns={
-        'id': 'ID', 'monto': 'Monto', 'tipo': 'Tipo',
-        'categoria': 'Categoría', 'activity_name': 'Nombre de la actividad', 'fecha': 'Fecha'
+        'id': 'ID', 'monto': 'Monto', 'tipo': 'Tipo', 'categoria': 'Categoría',
+        'subcategoria_nombre': 'Subcategoría',
+        'activity_name': 'Nombre de la actividad', 'fecha': 'Fecha'
     })
     st.dataframe(df_ahorros_display, use_container_width=True)
 
@@ -856,6 +880,15 @@ else:
         with col_p2:
             st.metric('Ahorrado / Objetivo', f'${ahorrado:,.2f}',
                       delta=f'Meta: ${objetivo:,.2f} ({pct:.1f}%)', delta_color='normal')
+        _cat_meta = _norm_id(meta['category_id'])
+        _sub_meta = _norm_id(meta['subcategory_id'])
+        if _sub_meta is not None and not df_ahorros.empty:
+            _misma_cat = df_ahorros[df_ahorros['category_id'].map(_norm_id) == _cat_meta]
+            _fuera = _misma_cat[_misma_cat['subcategory_id'].map(_norm_id) != _sub_meta]
+            _neto_fuera = _neto_ahorros(_fuera)
+            if abs(_neto_fuera) >= 0.01:
+                st.caption(f'⚠️ ${_neto_fuera:,.2f} de «{meta["categoria_nombre"]}» no cuentan '
+                           f'para esta meta: quedaron sin subcategoría o con otra distinta.')
         if st.button(f'Eliminar meta #{int(meta["id"])}', key=f'del_meta_{int(meta["id"])}'):
             conn_del = get_conn()
             conn_del.execute('DELETE FROM metas_ahorro WHERE id=?', (int(meta['id']),))
@@ -863,6 +896,49 @@ else:
             st.success(f'Meta "{meta["nombre"]}" eliminada.')
             st.rerun()
         st.markdown('---')
+
+# --- Conciliacion: Saldo Ahorros vs. metas ---
+with st.expander('🔎 Conciliación: Saldo Ahorros vs. metas'):
+    st.caption('El Saldo Ahorros suma TODOS los movimientos. Cada meta suma solo los de '
+               'su categoría y subcategoría. Aquí ves la diferencia.')
+    if df_ahorros.empty:
+        st.info('No hay movimientos de ahorros registrados.')
+    else:
+        _claves_metas = [(_norm_id(m['category_id']), _norm_id(m['subcategory_id']))
+                         for _, m in df_metas.iterrows()]
+
+        def _cuenta_para_alguna_meta(fila):
+            _c = _norm_id(fila['category_id'])
+            _s = _norm_id(fila['subcategory_id'])
+            return any(_c == _mc and (_ms is None or _ms == _s) for _mc, _ms in _claves_metas)
+
+        if _claves_metas:
+            _mask = df_ahorros.apply(_cuenta_para_alguna_meta, axis=1).astype(bool)
+        else:
+            _mask = pd.Series(False, index=df_ahorros.index)
+        _en_metas    = _neto_ahorros(df_ahorros[_mask])
+        _sin_asignar = _neto_ahorros(df_ahorros[~_mask])
+
+        _cc1, _cc2, _cc3 = st.columns(3)
+        _cc1.metric('Saldo Ahorros (global)', f'${saldo_ahorros:,.2f}')
+        _cc2.metric('Asignado a metas', f'${_en_metas:,.2f}')
+        _cc3.metric('Sin asignar a ninguna meta', f'${_sin_asignar:,.2f}')
+
+        if abs(_sin_asignar) < 0.01:
+            st.success('Todos tus ahorros están asignados a alguna meta.')
+        else:
+            st.warning('Estos movimientos suman al Saldo Ahorros pero no a ninguna meta. '
+                       'Normalmente son los que quedaron en «(Sin subcategoría)» '
+                       'o en una categoría sin meta.')
+            _cols_sa = [c for c in ('id', 'fecha', 'monto', 'tipo', 'categoria',
+                                    'subcategoria_nombre', 'activity_name')
+                        if c in df_ahorros.columns]
+            st.dataframe(
+                df_ahorros[~_mask][_cols_sa].sort_values('fecha', ascending=False).rename(
+                    columns={'id': 'ID', 'fecha': 'Fecha', 'monto': 'Monto', 'tipo': 'Tipo',
+                             'categoria': 'Categoría', 'subcategoria_nombre': 'Subcategoría',
+                             'activity_name': 'Nombre de la actividad'}),
+                use_container_width=True)
 
 st.markdown('---')
 
