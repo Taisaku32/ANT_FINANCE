@@ -232,20 +232,23 @@ def cargar_metas_ahorro():
     """)
 
 def calcular_ahorrado_meta(category_id: int, subcategory_id) -> float:
+    """Saldo neto ahorrado para la meta: depositos - retiros de esa categoria/subcategoria."""
     sub_id = None if (subcategory_id is None or
                       (isinstance(subcategory_id, float) and pd.isna(subcategory_id))) \
              else int(subcategory_id)
+    saldo_neto = ("COALESCE(SUM(CASE WHEN tipo='deposito' THEN monto ELSE 0 END), 0.0) - "
+                  "COALESCE(SUM(CASE WHEN tipo='retiro'   THEN monto ELSE 0 END), 0.0)")
     conn = get_conn()
     if sub_id is None:
         row = conn.execute(
-            "SELECT COALESCE(SUM(monto),0.0) FROM ahorros WHERE tipo='deposito' AND category_id=?",
+            f"SELECT {saldo_neto} FROM ahorros WHERE category_id=?",
             (category_id,)).fetchone()
     else:
         row = conn.execute(
-            "SELECT COALESCE(SUM(monto),0.0) FROM ahorros WHERE tipo='deposito' AND category_id=? AND subcategory_id=?",
+            f"SELECT {saldo_neto} FROM ahorros WHERE category_id=? AND subcategory_id=?",
             (category_id, sub_id)).fetchone()
     conn.close()
-    return float(row[0]) if row else 0.0
+    return float(row[0]) if row and row[0] is not None else 0.0
 
 def cargar_presupuestos() -> pd.DataFrame:
     try:
@@ -849,7 +852,7 @@ else:
         st.markdown(f"**{meta['nombre']}** — {meta['categoria_nombre']}{label_sub}")
         col_p1, col_p2 = st.columns([3, 1])
         with col_p1:
-            st.progress(min(int(pct), 100))
+            st.progress(max(0, min(int(pct), 100)))
         with col_p2:
             st.metric('Ahorrado / Objetivo', f'${ahorrado:,.2f}',
                       delta=f'Meta: ${objetivo:,.2f} ({pct:.1f}%)', delta_color='normal')
