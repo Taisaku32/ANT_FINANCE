@@ -255,22 +255,71 @@ def _neto_ahorros(df: pd.DataFrame) -> float:
     return float((montos * signo).sum())
 
 
-def calcular_ahorrado_meta(category_id: int, subcategory_id) -> float:
-    """Saldo neto ahorrado para la meta: depositos - retiros de esa categoria/subcategoria."""
-    sub_id = _norm_id(subcategory_id)
-    saldo_neto = ("COALESCE(SUM(CASE WHEN tipo='deposito' THEN monto ELSE 0 END), 0.0) - "
-                  "COALESCE(SUM(CASE WHEN tipo='retiro'   THEN monto ELSE 0 END), 0.0)")
-    conn = get_conn()
-    if sub_id is None:
-        row = conn.execute(
-            f"SELECT {saldo_neto} FROM ahorros WHERE category_id=?",
-            (category_id,)).fetchone()
+def _mascara_cubierta(df_ahorros: pd.DataFrame, df_metas: pd.DataFrame) -> pd.Series:
+    """True en los movimientos que pertenecen al menos a una meta."""
+    if df_ahorros.empty:
+        return pd.Series(dtype=bool)
+    cubierto = pd.Series(False, index=df_ahorros.index)
+    if df_metas.empty:
+        return cubierto
+    cats = df_ahorros['category_id'].map(_norm_id)
+    subs = df_ahorros['subcategory_id'].map(_norm_id)
+    for _, m in df_metas.iterrows():
+        mc, ms = _norm_id(m['category_id']), _norm_id(m['subcategory_id'])
+        cubierto |= (cats == mc) if ms is None else ((cats == mc) & (subs == ms))
+    return cubierto
+
+
+def calcular_progreso_metas(df_ahorros: pd.DataFrame, df_metas: pd.DataFrame) -> pd.DataFrame:
+    """Progreso de cada meta medido contra el saldo real de ahorros.
+
+    Los ahorros son un solo bolsillo: un retiro hecho con otros fines deja menos
+    plata disponible para la meta aunque se haya etiquetado en otra categoria.
+    Por eso los retiros que no pertenecen a ninguna meta se reparten entre las
+    metas (en proporcion a su saldo) y asi la suma de las metas cuadra con el
+    Saldo Ahorros. Los depositos ajenos a toda meta NO se suman: son ahorro
+    destinado a otra cosa.
+
+    Devuelve df_metas con tres columnas nuevas:
+      neto_propio    depositos - retiros de su propia categoria/subcategoria
+      ajuste_retiros parte que le toca de los retiros hechos con otros fines (<= 0)
+      ahorrado       neto_propio + ajuste_retiros (lo que muestra la barra)
+    """
+    res = df_metas.copy()
+    if res.empty:
+        for col in ('neto_propio', 'ajuste_retiros', 'ahorrado'):
+            res[col] = pd.Series(dtype='float64')
+        return res
+    if df_ahorros.empty:
+        for col in ('neto_propio', 'ajuste_retiros', 'ahorrado'):
+            res[col] = 0.0
+        return res
+
+    cats = df_ahorros['category_id'].map(_norm_id)
+    subs = df_ahorros['subcategory_id'].map(_norm_id)
+    netos = []
+    for _, m in res.iterrows():
+        mc, ms = _norm_id(m['category_id']), _norm_id(m['subcategory_id'])
+        mask = (cats == mc) if ms is None else ((cats == mc) & (subs == ms))
+        netos.append(_neto_ahorros(df_ahorros[mask]))
+    res['neto_propio'] = netos
+
+    fuera = df_ahorros[~_mascara_cubierta(df_ahorros, res)]
+    retiros_fuera = float(pd.to_numeric(
+        fuera[fuera['tipo'] == 'retiro']['monto'], errors='coerce').fillna(0.0).sum())
+
+    pesos = res['neto_propio'].clip(lower=0.0)
+    total_pesos = float(pesos.sum())
+    if retiros_fuera <= 0:
+        res['ajuste_retiros'] = 0.0
+    elif total_pesos > 0:
+        res['ajuste_retiros'] = -retiros_fuera * pesos / total_pesos
     else:
-        row = conn.execute(
-            f"SELECT {saldo_neto} FROM ahorros WHERE category_id=? AND subcategory_id=?",
-            (category_id, sub_id)).fetchone()
-    conn.close()
-    return float(row[0]) if row and row[0] is not None else 0.0
+        res['ajuste_retiros'] = -retiros_fuera / len(res)
+
+    res['ahorrado'] = res['neto_propio'] + res['ajuste_retiros']
+    return res
+
 
 def cargar_presupuestos() -> pd.DataFrame:
     try:
@@ -864,11 +913,12 @@ else:
 
 st.subheader('Progreso de metas')
 df_metas = cargar_metas_ahorro()
+df_progreso = calcular_progreso_metas(df_ahorros, df_metas)
 if df_metas.empty:
     st.info('No hay metas registradas. Crea una arriba.')
 else:
-    for _, meta in df_metas.iterrows():
-        ahorrado = calcular_ahorrado_meta(int(meta['category_id']), meta['subcategory_id'])
+    for _, meta in df_progreso.iterrows():
+        ahorrado = float(meta['ahorrado'])
         objetivo = float(meta['monto_objetivo'])
         pct      = (ahorrado / objetivo * 100) if objetivo > 0 else 0.0
         label_sub = f" / {meta['subcategoria_nombre']}" \
@@ -880,15 +930,10 @@ else:
         with col_p2:
             st.metric('Ahorrado / Objetivo', f'${ahorrado:,.2f}',
                       delta=f'Meta: ${objetivo:,.2f} ({pct:.1f}%)', delta_color='normal')
-        _cat_meta = _norm_id(meta['category_id'])
-        _sub_meta = _norm_id(meta['subcategory_id'])
-        if _sub_meta is not None and not df_ahorros.empty:
-            _misma_cat = df_ahorros[df_ahorros['category_id'].map(_norm_id) == _cat_meta]
-            _fuera = _misma_cat[_misma_cat['subcategory_id'].map(_norm_id) != _sub_meta]
-            _neto_fuera = _neto_ahorros(_fuera)
-            if abs(_neto_fuera) >= 0.01:
-                st.caption(f'⚠️ ${_neto_fuera:,.2f} de «{meta["categoria_nombre"]}» no cuentan '
-                           f'para esta meta: quedaron sin subcategoría o con otra distinta.')
+        _ajuste = float(meta['ajuste_retiros'])
+        if abs(_ajuste) >= 0.01:
+            st.caption(f'Abonado a esta meta: ${float(meta["neto_propio"]):,.2f} · '
+                       f'retirado con otros fines: −${abs(_ajuste):,.2f}')
         if st.button(f'Eliminar meta #{int(meta["id"])}', key=f'del_meta_{int(meta["id"])}'):
             conn_del = get_conn()
             conn_del.execute('DELETE FROM metas_ahorro WHERE id=?', (int(meta['id']),))
@@ -899,42 +944,44 @@ else:
 
 # --- Conciliacion: Saldo Ahorros vs. metas ---
 with st.expander('🔎 Conciliación: Saldo Ahorros vs. metas'):
-    st.caption('El Saldo Ahorros suma TODOS los movimientos. Cada meta suma solo los de '
-               'su categoría y subcategoría. Aquí ves la diferencia.')
+    st.caption('Los ahorros son un solo bolsillo. Los retiros hechos con otros fines ya se '
+               'descuentan de las metas, así que la suma de las metas más los depósitos sin '
+               'meta da exactamente el Saldo Ahorros.')
     if df_ahorros.empty:
         st.info('No hay movimientos de ahorros registrados.')
     else:
-        _claves_metas = [(_norm_id(m['category_id']), _norm_id(m['subcategory_id']))
-                         for _, m in df_metas.iterrows()]
-
-        def _cuenta_para_alguna_meta(fila):
-            _c = _norm_id(fila['category_id'])
-            _s = _norm_id(fila['subcategory_id'])
-            return any(_c == _mc and (_ms is None or _ms == _s) for _mc, _ms in _claves_metas)
-
-        if _claves_metas:
-            _mask = df_ahorros.apply(_cuenta_para_alguna_meta, axis=1).astype(bool)
-        else:
-            _mask = pd.Series(False, index=df_ahorros.index)
-        _en_metas    = _neto_ahorros(df_ahorros[_mask])
-        _sin_asignar = _neto_ahorros(df_ahorros[~_mask])
+        _fuera_de_metas = df_ahorros[~_mascara_cubierta(df_ahorros, df_metas)]
+        _retiros_otros = float(pd.to_numeric(
+            _fuera_de_metas[_fuera_de_metas['tipo'] == 'retiro']['monto'],
+            errors='coerce').fillna(0.0).sum())
+        _dep_sin_meta = float(pd.to_numeric(
+            _fuera_de_metas[_fuera_de_metas['tipo'] == 'deposito']['monto'],
+            errors='coerce').fillna(0.0).sum())
+        _suma_metas = float(df_progreso['ahorrado'].sum()) if not df_progreso.empty else 0.0
 
         _cc1, _cc2, _cc3 = st.columns(3)
         _cc1.metric('Saldo Ahorros (global)', f'${saldo_ahorros:,.2f}')
-        _cc2.metric('Asignado a metas', f'${_en_metas:,.2f}')
-        _cc3.metric('Sin asignar a ninguna meta', f'${_sin_asignar:,.2f}')
+        _cc2.metric('Suma de las metas', f'${_suma_metas:,.2f}')
+        _cc3.metric('Depósitos sin meta', f'${_dep_sin_meta:,.2f}')
 
-        if abs(_sin_asignar) < 0.01:
-            st.success('Todos tus ahorros están asignados a alguna meta.')
+        _descuadre = saldo_ahorros - (_suma_metas + _dep_sin_meta)
+        if abs(_descuadre) < 0.01:
+            st.success(f'Cuadra: ${_suma_metas:,.2f} (metas) + ${_dep_sin_meta:,.2f} '
+                       f'(depósitos sin meta) = ${saldo_ahorros:,.2f}')
         else:
-            st.warning('Estos movimientos suman al Saldo Ahorros pero no a ninguna meta. '
-                       'Normalmente son los que quedaron en «(Sin subcategoría)» '
-                       'o en una categoría sin meta.')
+            st.error(f'Descuadre de ${_descuadre:,.2f}. Revisa los movimientos de abajo.')
+
+        if _retiros_otros >= 0.01:
+            st.info(f'Se descontaron ${_retiros_otros:,.2f} en retiros hechos con otros fines '
+                    f'(no pertenecen a ninguna meta pero salieron del mismo bolsillo).')
+
+        if not _fuera_de_metas.empty:
+            st.caption('Movimientos que no pertenecen a ninguna meta:')
             _cols_sa = [c for c in ('id', 'fecha', 'monto', 'tipo', 'categoria',
                                     'subcategoria_nombre', 'activity_name')
                         if c in df_ahorros.columns]
             st.dataframe(
-                df_ahorros[~_mask][_cols_sa].sort_values('fecha', ascending=False).rename(
+                _fuera_de_metas[_cols_sa].sort_values('fecha', ascending=False).rename(
                     columns={'id': 'ID', 'fecha': 'Fecha', 'monto': 'Monto', 'tipo': 'Tipo',
                              'categoria': 'Categoría', 'subcategoria_nombre': 'Subcategoría',
                              'activity_name': 'Nombre de la actividad'}),
